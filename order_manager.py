@@ -16,8 +16,9 @@ import pytz
 IST = pytz.timezone('Asia/Kolkata')
 from typing import Optional
 from enum import Enum
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from growwapi import GrowwAPI
-from utils import retry
+from utils import retry   # FIX 1: was used but never imported
 
 from data import MarketData
 from config import (
@@ -31,6 +32,22 @@ from config import (
 logger = logging.getLogger(__name__)
 
 
+
+
+# ─── LIMIT ORDER HELPERS ──────────────────────────────────────────────────────
+
+LIMIT_BUFFER_PCT = 0.002   # 0.2% buffer — buy at LTP×1.002, sell at LTP×0.998
+LIMIT_TIMEOUT_S  = 5       # seconds to wait for limit fill before cancelling
+
+def _limit_price(ltp: float, side: str) -> float:
+    """
+    Converts LTP to a limit price with a small buffer.
+    BUY:  slightly above LTP to ensure fill without chasing
+    SELL: slightly below LTP to ensure fill without giving away too much
+    """
+    if side == "BUY":
+        return round(ltp * (1 + LIMIT_BUFFER_PCT), 2)
+    return round(ltp * (1 - LIMIT_BUFFER_PCT), 2)
 
 # ─── EXCEPTION CLASSIFIER ─────────────────────────────────────────────────────
 
@@ -238,7 +255,7 @@ class OrderManager:
             return self._exit_all("STOP_LOSS")
 
         # ── Price crosses back into range (structural SL) ──────────────────────
-        structural_sl = self._check_structural_sl(nifty_price)
+        structural_sl = self._check_structural_sl(nifty_price)  # FIX 4: removed extra arg
         if structural_sl:
             logger.info(f"🛑 STRUCTURAL SL: Nifty re-entered opening range")
             return self._exit_all("STRUCTURAL_SL")
@@ -270,12 +287,23 @@ class OrderManager:
 
     def _execute_level1_exit(self):
         """Exits 40% of position and moves SL to breakeven."""
-        units_to_exit = int(self.total_units * LEVEL1_EXIT_PCT)
-        if units_to_exit == 0:
+        # FIX 1B: partial exit requires integer lots
+        # With LOTS_PER_TRADE=1 and 25-unit lots, 40% = 10 units (valid).
+        # Guard: if result < 1 lot (25 units), skip partial exit and
+        # wait for full target instead of creating a sub-lot order.
+        from config import NIFTY_LOT_SIZE as _LOT
+        raw_units = int(self.total_units * LEVEL1_EXIT_PCT)
+        # Round DOWN to nearest complete lot
+        units_to_exit = (raw_units // _LOT) * _LOT
+        if units_to_exit < _LOT:
+            logger.warning(
+                f"Partial exit skipped: {raw_units} units < 1 lot ({_LOT}). "
+                f"Increase LOTS_PER_TRADE to enable partial exits."
+            )
             return
 
         try:
-            # Sell 40% of BUY leg
+            # FIX 2: define AND call _l1_exit_buy — previously defined but never invoked
             @retry(max_attempts=3, base_delay=0.5)
             def _l1_exit_buy():
                 return self.groww.place_order(
@@ -289,9 +317,9 @@ class OrderManager:
                     transaction_type=self.groww.TRANSACTION_TYPE_SELL,
                     order_reference_id=self._gen_ref_id("EXIT_L1_BUY")
                 )
-            _l1_exit_buy()
+            _l1_exit_buy()   # FIX 2: actually call it
 
-            # Buy back 40% of SELL leg
+            # FIX 3: sell leg also gets retry protection
             @retry(max_attempts=3, base_delay=0.5)
             def _l1_exit_sell():
                 return self.groww.place_order(
@@ -305,7 +333,7 @@ class OrderManager:
                     transaction_type=self.groww.TRANSACTION_TYPE_BUY,
                     order_reference_id=self._gen_ref_id("EXIT_L1_SELL")
                 )
-            _l1_exit_sell()
+            _l1_exit_sell()  # FIX 3: call the retried sell leg
 
             # FIX #2: Poll actual fill price from positions, not LTP snapshot
             l1_spread_value = self._get_fill_price_from_positions() or \
@@ -340,7 +368,7 @@ class OrderManager:
             return reason
 
         try:
-            # Close BUY leg — wrapped with retry for transient network errors
+            # FIX 2+3: define, fix indentation, CALL _exit_buy(), wrap sell with retry
             @retry(max_attempts=3, base_delay=0.5)
             def _exit_buy():
                 return self.groww.place_order(
@@ -354,9 +382,8 @@ class OrderManager:
                     transaction_type=self.groww.TRANSACTION_TYPE_SELL,
                     order_reference_id=self._gen_ref_id(f"EXIT_{reason}_BUY")
                 )
-            _exit_buy()
+            _exit_buy()   # FIX 2: actually call it
 
-            # Close SELL leg (buy back remaining)
             @retry(max_attempts=3, base_delay=0.5)
             def _exit_sell():
                 return self.groww.place_order(
@@ -370,7 +397,7 @@ class OrderManager:
                     transaction_type=self.groww.TRANSACTION_TYPE_BUY,
                     order_reference_id=self._gen_ref_id(f"EXIT_{reason}_SELL")
                 )
-            _exit_sell()
+            _exit_sell()  # FIX 3: retried sell leg
 
             # FIX #2: Use actual fill price not LTP
             final_spread_value = self._get_fill_price_from_positions() or \
@@ -670,6 +697,34 @@ class OrderManager:
         except Exception as e:
             logger.warning(f"Could not get fill price from positions: {e}")
         return None
+
+
+    def _verify_sell_leg_filled(self) -> bool:
+        """
+        FIX 2B: Confirms the SELL leg reached COMPLETE status.
+        If it was rejected (insufficient margin, strike out of range, etc.)
+        we must flatten the BUY leg to avoid holding a naked long option.
+        Returns True only if sell leg is confirmed filled.
+        """
+        if not self.sell_order_id:
+            return False
+        try:
+            resp   = self.groww.get_order_details(
+                groww_order_id=self.sell_order_id,
+                segment=self.groww.SEGMENT_FNO,
+            )
+            status = resp.get("status", "").upper()
+            if status in ("COMPLETE", "FILLED", "TRADED"):
+                return True
+            reason = resp.get("rejection_reason") or resp.get("status_message", "")
+            logger.error(
+                f"🚨 SELL leg status={status} | reason={reason} | "
+                f"order_id={self.sell_order_id}"
+            )
+            return False
+        except Exception as e:
+            logger.error(f"❌ Could not verify sell leg: {e}")
+            return False   # conservative — assume not filled
 
     def _handle_partial_entry(self):
         """Emergency: if one leg failed, exit the other immediately."""

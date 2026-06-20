@@ -200,7 +200,21 @@ class TradingAgent:
         self.vix = self._get_vix()
         self.engine.vix = self.vix
 
-        # 5. Risk daily reset
+        # 5. FIX 5: Reconcile risk state against broker ledger BEFORE
+        #    resetting daily P&L — catches crash-mid-trade scenarios
+        #    where a loss was never written to risk_state.json.
+        recon = self.risk.reconcile_with_broker(self.groww)
+        if recon.get("corrected"):
+            logger.warning(
+                f"🚨 Risk state was corrected on startup: "
+                f"local=₹{recon['local_pnl']:.0f} → broker=₹{recon['broker_pnl']:.0f}"
+            )
+            alert_risk_circuit(
+                f"Risk state corrected on startup — local P&L was stale. "
+                f"True daily P&L: ₹{recon['broker_pnl']:.0f}"
+            )
+
+        # 5b. Reset daily P&L counter for the new trading day
         self.risk.reset_daily_pnl()
 
         # 6. Pre-market strategy checks

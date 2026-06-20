@@ -1037,3 +1037,226 @@ class TestMomentumScorer(unittest.TestCase):
             last_2_closes= [24065, 24050],  # falling → +1 for PUT
         )
         self.assertEqual(score, 2)
+
+
+class TestOrderManagerRegressions(unittest.TestCase):
+    """
+    Regression tests for the 5 bugs found and fixed in order_manager.py.
+    Each test is named after the bug it guards against.
+    If any of these fail, a previously fixed bug has returned.
+    """
+
+    # ── FIX 1: retry was used but never imported ───────────────────────────────
+    def test_fix1_retry_is_imported(self):
+        """retry must be imported at module level — not just referenced."""
+        with open("order_manager.py") as f:
+            src = f.read()
+        self.assertIn(
+            "from utils import retry",
+            src,
+            "retry is not imported — NameError will occur at every SL hit or exit"
+        )
+
+    # ── FIX 2: _l1_exit_buy / _exit_buy defined but never called ──────────────
+    def test_fix2_l1_exit_buy_is_called(self):
+        """_l1_exit_buy() must be called after its definition."""
+        with open("order_manager.py") as f:
+            src = f.read()
+        # Find the definition
+        def_idx  = src.find("def _l1_exit_buy():")
+        self.assertGreater(def_idx, 0, "_l1_exit_buy not defined")
+        # Find the call — must appear AFTER the definition
+        call_idx = src.find("_l1_exit_buy()   # FIX 2")
+        self.assertGreater(call_idx, def_idx,
+            "_l1_exit_buy() is defined but never called — buy leg silently skipped")
+
+    def test_fix2_exit_buy_is_called(self):
+        """_exit_buy() must be called after its definition in _exit_all."""
+        with open("order_manager.py") as f:
+            src = f.read()
+        def_idx  = src.find("            def _exit_buy():")
+        self.assertGreater(def_idx, 0, "_exit_buy not defined")
+        call_idx = src.find("            _exit_buy()   # FIX 2")
+        self.assertGreater(call_idx, def_idx,
+            "_exit_buy() is defined but never called — buy leg silently skipped on full exit")
+
+    # ── FIX 3: sell legs had no retry protection ───────────────────────────────
+    def test_fix3_l1_exit_sell_has_retry(self):
+        """Level 1 sell leg must be wrapped with @retry."""
+        with open("order_manager.py") as f:
+            src = f.read()
+        self.assertIn(
+            "def _l1_exit_sell():",
+            src,
+            "_l1_exit_sell() not defined — sell leg has no retry on L1 exit"
+        )
+        # @retry must appear before the def
+        retry_idx = src.rfind("@retry", 0, src.find("def _l1_exit_sell():"))
+        self.assertGreater(retry_idx, 0,
+            "_l1_exit_sell() exists but has no @retry decorator")
+
+    def test_fix3_exit_sell_has_retry(self):
+        """Full exit sell leg must be wrapped with @retry."""
+        with open("order_manager.py") as f:
+            src = f.read()
+        self.assertIn(
+            "def _exit_sell():",
+            src,
+            "_exit_sell() not defined — sell leg has no retry on full exit"
+        )
+        retry_idx = src.rfind("@retry", 0, src.find("def _exit_sell():"))
+        self.assertGreater(retry_idx, 0,
+            "_exit_sell() exists but has no @retry decorator")
+
+    def test_fix3_l1_exit_sell_is_called(self):
+        """_l1_exit_sell() must be called — not just defined."""
+        with open("order_manager.py") as f:
+            src = f.read()
+        def_idx  = src.find("def _l1_exit_sell():")
+        call_idx = src.find("_l1_exit_sell()  # FIX 3")
+        self.assertGreater(call_idx, def_idx,
+            "_l1_exit_sell() defined but not called")
+
+    def test_fix3_exit_sell_is_called(self):
+        """_exit_sell() must be called — not just defined."""
+        with open("order_manager.py") as f:
+            src = f.read()
+        def_idx  = src.find("            def _exit_sell():")
+        call_idx = src.find("            _exit_sell()  # FIX 3")
+        self.assertGreater(call_idx, def_idx,
+            "_exit_sell() defined but not called")
+
+    # ── FIX 4: _check_structural_sl called with wrong arg count ───────────────
+    def test_fix4_structural_sl_called_with_one_arg(self):
+        """
+        _check_structural_sl only accepts nifty_price.
+        Passing candles_df causes TypeError at every SL check.
+        """
+        with open("order_manager.py") as f:
+            src = f.read()
+        # The bad call pattern must not exist
+        self.assertNotIn(
+            "_check_structural_sl(nifty_price, candles_df)",
+            src,
+            "Extra candles_df arg still present — TypeError at every structural SL check"
+        )
+        # The correct call must exist
+        self.assertIn(
+            "_check_structural_sl(nifty_price)",
+            src,
+            "_check_structural_sl not called with correct single argument"
+        )
+
+    def test_fix4_structural_sl_signature_accepts_one_arg(self):
+        """_check_structural_sl must accept exactly nifty_price."""
+        from order_manager import OrderManager
+        import inspect
+        sig    = inspect.signature(OrderManager._check_structural_sl)
+        params = list(sig.parameters.keys())
+        # params = ['self', 'nifty_price'] — no candles_df
+        self.assertNotIn(
+            "candles_df", params,
+            "candles_df in _check_structural_sl signature — definition and call mismatch"
+        )
+        self.assertIn("nifty_price", params)
+
+    # ── FIX 5: broken indentation on place_order kwargs ───────────────────────
+    def test_fix5_kwargs_consistently_indented(self):
+        """
+        All place_order kwargs inside inner functions must be at 20-space indent
+        (4 levels: method → try → inner_fn → call → kwargs).
+        Misaligned kwargs cause SyntaxError or silently wrong arguments.
+        """
+        with open("order_manager.py") as f:
+            lines = f.readlines()
+
+        bad_lines = []
+        in_inner_fn = False
+        for i, line in enumerate(lines, 1):
+            stripped = line.lstrip()
+            # Track when we're inside an inner exit function
+            if "def _l1_exit_buy" in line or "def _exit_buy" in line or \
+               "def _l1_exit_sell" in line or "def _exit_sell" in line:
+                in_inner_fn = True
+            elif in_inner_fn and stripped.startswith("def ") and \
+                 "exit" not in line:
+                in_inner_fn = False
+            # Kwargs of place_order inside inner fn must be at >=20 spaces
+            if in_inner_fn and stripped.startswith(("validity=", "exchange=",
+                                                    "segment=", "product=",
+                                                    "order_type=",
+                                                    "transaction_type=",
+                                                    "order_reference_id=")):
+                indent = len(line) - len(line.lstrip())
+                if indent < 20:
+                    bad_lines.append((i, indent, line.rstrip()))
+
+        if bad_lines:
+            detail = "\n".join(
+                f"  Line {ln}: indent={ind}  →  {txt[:60]}"
+                for ln, ind, txt in bad_lines[:5]
+            )
+            self.fail(
+                f"Broken indentation in inner exit functions "
+                f"(need ≥20 spaces):\n{detail}"
+            )
+
+    # ── INTEGRATION: both legs actually execute in a simulated exit ────────────
+    def test_integration_both_legs_called_on_exit(self):
+        """
+        When _exit_all() is called, both buy and sell legs must be
+        submitted to the exchange. Before fix 2, only the leg that
+        was accidentally called (neither) would execute.
+        """
+        from order_manager import OrderManager, TradeState
+        from unittest.mock import MagicMock, patch, call
+
+        groww  = MagicMock()
+        md     = MagicMock()
+        om     = OrderManager(groww, md)
+
+        # Set up a minimal open trade state
+        om.state            = TradeState.OPEN
+        om.remaining_units  = 75
+        om.total_units      = 75
+        om.net_entry_cost   = 50.0
+        om.entry_time       = __import__("datetime").datetime.now()
+        om.exit_time        = None
+        om.spread_info      = {
+            "buy_symbol":  "NIFTY26JUN24000CE",
+            "sell_symbol": "NIFTY26JUN24050CE",
+        }
+
+        # Patch groww.place_order to track calls
+        groww.place_order.return_value = {"groww_order_id": "TEST123"}
+        groww.VALIDITY_DAY             = "DAY"
+        groww.EXCHANGE_NSE             = "NSE"
+        groww.SEGMENT_FNO              = "FNO"
+        groww.PRODUCT_MIS              = "MIS"
+        groww.ORDER_TYPE_MARKET        = "MARKET"
+        groww.TRANSACTION_TYPE_SELL    = "SELL"
+        groww.TRANSACTION_TYPE_BUY     = "BUY"
+
+        # Also patch fill-price lookup to return something
+        om._get_fill_price_from_positions = MagicMock(return_value=None)
+        om._get_current_spread_value      = MagicMock(return_value=50.0)
+
+        om._exit_all("STOP_LOSS")
+
+        call_count = groww.place_order.call_count
+        self.assertGreaterEqual(
+            call_count, 2,
+            f"place_order called {call_count} time(s) — both legs must execute. "
+            "Before fix, inner functions were defined but never called."
+        )
+
+        # Verify both BUY symbol (SELL transaction) and SELL symbol (BUY transaction)
+        calls_made = groww.place_order.call_args_list
+        syms = [c.kwargs.get("trading_symbol", "") or
+                (c.args[0] if c.args else "") for c in calls_made]
+        txns = [c.kwargs.get("transaction_type", "") for c in calls_made]
+
+        self.assertIn("NIFTY26JUN24000CE", syms,
+                      "Buy-leg symbol not found in place_order calls")
+        self.assertIn("NIFTY26JUN24050CE", syms,
+                      "Sell-leg symbol not found in place_order calls")

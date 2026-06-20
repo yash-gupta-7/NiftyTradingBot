@@ -243,9 +243,10 @@ class StrategyEngine:
         For BUY_CALL: spot must be ABOVE VWAP.
         For BUY_PUT:  spot must be BELOW VWAP.
         """
+        # FIX 4: fail-closed
         if self.md.vwap is None:
-            logger.warning("VWAP not computed yet — skipping VWAP filter")
-            return None
+            logger.warning("VWAP unavailable — blocking entry (fail-closed)")
+            return SkipReason.VWAP_MISMATCH   # conservative skip
 
         live_price = self.md.get_live_nifty_price()
         if live_price is None:
@@ -305,26 +306,26 @@ class StrategyEngine:
     # ─── INDIVIDUAL PRE-MARKET CHECKS ─────────────────────────────────────────
 
     def _check_calendar_day(self) -> Optional[SkipReason]:
-        """Skips Thursdays (expiry), known event days, holiday eves."""
-        today = date.today()
-        today_str = today.strftime("%Y-%m-%d")
+        """
+        FIX 6: Uses EventCalendar (auto-checking + staleness warnings)
+        instead of relying solely on a hardcoded list.
+        """
+        from event_calendar import EventCalendar
+        cal = EventCalendar()
+        cal.check_staleness()   # logs warning if calendar needs refresh
 
-        # Thursday = expiry day
-        if today.weekday() == 3:
-            logger.info(f"📅 Today is Thursday (expiry day) — SKIP")
-            return SkipReason.CALENDAR_DAY
-
-        # Known skip dates
-        if today_str in SKIP_DATES:
-            logger.info(f"📅 {today_str} is in SKIP_DATES — SKIP")
+        should_skip, reason = cal.is_skip_day()
+        if should_skip:
+            logger.info(f"📅 SKIP: {reason}")
             return SkipReason.CALENDAR_DAY
 
         return None
 
     def _check_vix(self) -> Optional[SkipReason]:
+        # FIX 4: fail-closed — missing data blocks the trade
         if self.vix is None:
-            logger.warning("VIX not set — skipping VIX check")
-            return None
+            logger.warning("VIX unavailable — blocking trade (fail-closed)")
+            return SkipReason.VIX_OUT_OF_RANGE   # conservative skip
         if self.vix < VIX_MIN or self.vix > VIX_MAX:
             logger.info(f"⚡ VIX={self.vix} outside range [{VIX_MIN}, {VIX_MAX}] — SKIP")
             return SkipReason.VIX_OUT_OF_RANGE
@@ -334,9 +335,10 @@ class StrategyEngine:
         return None
 
     def _check_adx(self) -> Optional[SkipReason]:
+        # FIX 4: fail-closed
         if self.md.adx_value is None:
-            logger.warning("ADX not computed — skipping ADX check")
-            return None
+            logger.warning("ADX unavailable — blocking trade (fail-closed)")
+            return SkipReason.ADX_TOO_LOW   # conservative skip
         if self.md.adx_value < ADX_MIN:
             logger.info(f"📊 ADX={self.md.adx_value} < {ADX_MIN} (choppy market) — SKIP")
             return SkipReason.ADX_TOO_LOW
@@ -349,8 +351,10 @@ class StrategyEngine:
         return None
 
     def _check_range_size(self) -> Optional[SkipReason]:
+        # FIX 4: fail-closed
         if self.md.range_size is None or self.md.atr20 is None:
-            return None
+            logger.warning("Range/ATR unavailable — blocking trade (fail-closed)")
+            return SkipReason.RANGE_TOO_SMALL
         min_range = self.md.atr20 * MIN_RANGE_ATR_MULTIPLE
         max_range = self.md.atr20 * MAX_RANGE_ATR_MULTIPLE
         if self.md.range_size < min_range:
@@ -362,8 +366,10 @@ class StrategyEngine:
         return None
 
     def _check_gap(self) -> Optional[SkipReason]:
+        # FIX 4: fail-closed
         if self.md.gap_pct is None:
-            return None
+            logger.warning("Gap data unavailable — blocking trade (fail-closed)")
+            return SkipReason.GAP_TOO_LARGE
         if self.md.gap_pct > MAX_GAP_PCT:
             logger.info(f"📊 Gap {self.md.gap_pct:.2f}% > {MAX_GAP_PCT}% — SKIP")
             return SkipReason.GAP_TOO_LARGE

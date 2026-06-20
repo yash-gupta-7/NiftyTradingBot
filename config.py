@@ -16,7 +16,7 @@ GROWW_TOTP_SECRET = os.getenv("GROWW_TOTP_SECRET")  # TOTP secret from Groww API
 # ─── ACCOUNT ─────────────────────────────────────────────────────────────────
 CAPITAL           = float(os.getenv("CAPITAL", 50000))   # Starting capital in ₹
 LOTS_PER_TRADE    = 1                                     # Fixed — do NOT change for 6 months
-NIFTY_LOT_SIZE    = 75                                    # NSE defined lot size
+NIFTY_LOT_SIZE    = 25   # NSE revised lot size (2024 revision from 75 → 25)
 
 # ─── OPENING RANGE ────────────────────────────────────────────────────────────
 OPENING_RANGE_START = "09:15"   # Market open

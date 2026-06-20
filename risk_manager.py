@@ -41,40 +41,7 @@ class RiskManager:
 
     # ─── PUBLIC CHECKS ────────────────────────────────────────────────────────
 
-    def is_trading_allowed(self) -> Tuple[bool, str]:
-        """
-        Master check — call before any trade entry.
-        Returns (allowed, reason).
-        """
-        # 1. Consecutive loss circuit breaker
-        consec = self.state.get("consecutive_losses", 0)
-        if consec >= CONSECUTIVE_LOSS_STOP:
-            return False, f"STOPPED: {consec} consecutive losses — stop for the week"
-
-        if consec >= CONSECUTIVE_LOSS_PAUSE:
-            last_loss_date = self.state.get("last_loss_date")
-            if last_loss_date == str(date.today()):
-                return False, f"PAUSED: {consec} consecutive losses — skip today"
-
-        # 2. Daily loss limit
-        daily_pnl = self.state.get("daily_pnl", 0.0)
-        max_daily_loss = CAPITAL * MAX_DAILY_LOSS_PCT
-        if daily_pnl <= -max_daily_loss:
-            return False, f"DAILY LIMIT: loss ₹{abs(daily_pnl):.0f} > max ₹{max_daily_loss:.0f}"
-
-        # 3. Weekly loss limit
-        weekly_pnl = self._get_weekly_pnl()
-        max_weekly_loss = CAPITAL * MAX_WEEKLY_LOSS_PCT
-        if weekly_pnl <= -max_weekly_loss:
-            return False, f"WEEKLY LIMIT: loss ₹{abs(weekly_pnl):.0f} > max ₹{max_weekly_loss:.0f}"
-
-        # 4. Monthly loss limit
-        monthly_pnl = self._get_monthly_pnl()
-        max_monthly_loss = CAPITAL * MAX_MONTHLY_LOSS_PCT
-        if monthly_pnl <= -max_monthly_loss:
-            return False, f"MONTHLY LIMIT: loss ₹{abs(monthly_pnl):.0f} > max ₹{max_monthly_loss:.0f}"
-
-        return True, "OK"
+    # is_trading_allowed() moved above with FIX 5 unrealized P&L check
 
     def is_spread_cost_within_risk(self, spread_total_cost: float) -> Tuple[bool, str]:
         """
@@ -171,6 +138,144 @@ class RiskManager:
             "max_monthly_loss":   round(CAPITAL * MAX_MONTHLY_LOSS_PCT, 2),
         }
 
+
+    # ─── BROKER RECONCILIATION (FIX 5) ─────────────────────────────────────────
+
+    def reconcile_with_broker(self, groww) -> dict:
+        """
+        FIX 5 — Risk State Corruption:
+        On startup, recompute TODAY's realised P&L directly from the
+        broker's order/trade ledger instead of trusting the local JSON
+        blindly. This catches the case where the agent crashed mid-trade
+        and a loss was never written to risk_state.json.
+
+        Strategy:
+          1. Fetch all FNO orders for today from Groww.
+          2. Sum up realised P&L from COMPLETE sell-side trades that
+             closed a position (using average_price × quantity).
+          3. Compare against self.state['daily_pnl'].
+          4. If broker ledger shows MORE loss than local state →
+             local state is stale/corrupted → overwrite with broker truth.
+          5. If they match (or broker shows less / no data) → keep local state.
+
+        This makes daily/weekly/monthly loss limits trustworthy even after
+        a crash, network drop, or unclean shutdown.
+        """
+        try:
+            broker_pnl = self._compute_broker_realised_pnl_today(groww)
+        except Exception as e:
+            logger.error(
+                f"❌ Broker reconciliation failed: {e}. "
+                f"Falling back to local state — VERIFY MANUALLY before trading."
+            )
+            return {"reconciled": False, "reason": str(e)}
+
+        if broker_pnl is None:
+            logger.warning(
+                "⚠️ Could not compute broker P&L (no orders or API issue). "
+                "Using local state as-is."
+            )
+            return {"reconciled": False, "reason": "no_broker_data"}
+
+        local_pnl = self.state.get("daily_pnl", 0.0)
+
+        # Broker ledger is the source of truth whenever it shows MORE
+        # adverse P&L than local state — this is the crash-recovery case.
+        if broker_pnl < local_pnl:
+            logger.warning(
+                f"🚨 RISK STATE CORRECTED: local daily_pnl=₹{local_pnl:.2f} but "
+                f"broker ledger shows ₹{broker_pnl:.2f}. "
+                f"Local state was stale (likely crash mid-trade). Overwriting."
+            )
+            self.state["daily_pnl"] = broker_pnl
+            # Also true-up weekly/monthly by the same delta
+            delta = broker_pnl - local_pnl
+            week_key  = self._week_key()
+            month_key = self._month_key()
+            self.state.setdefault("weekly_pnl", {})
+            self.state.setdefault("monthly_pnl", {})
+            self.state["weekly_pnl"][week_key] = round(
+                self.state["weekly_pnl"].get(week_key, 0.0) + delta, 2
+            )
+            self.state["monthly_pnl"][month_key] = round(
+                self.state["monthly_pnl"].get(month_key, 0.0) + delta, 2
+            )
+            self._save_state()
+            return {
+                "reconciled": True,
+                "corrected": True,
+                "local_pnl": local_pnl,
+                "broker_pnl": broker_pnl,
+                "delta_applied": delta,
+            }
+
+        logger.info(
+            f"✅ Risk state reconciled: local=₹{local_pnl:.2f} | "
+            f"broker=₹{broker_pnl:.2f} | no correction needed"
+        )
+        return {
+            "reconciled": True,
+            "corrected": False,
+            "local_pnl": local_pnl,
+            "broker_pnl": broker_pnl,
+        }
+
+    def _compute_broker_realised_pnl_today(self, groww) -> Optional[float]:
+        """
+        Sums realised P&L from today's COMPLETE F&O orders.
+        Uses trade_list/order_list endpoint if available; falls back
+        to positions' realised P&L field if the broker exposes it directly.
+        """
+        from datetime import date as _date
+
+        # Preferred: broker often exposes realised P&L directly on positions
+        try:
+            positions = groww.get_positions_for_user(segment=groww.SEGMENT_FNO)
+            pos_list  = positions.get("positions", [])
+            if pos_list:
+                total = 0.0
+                found_any = False
+                for p in pos_list:
+                    # Different SDKs expose this as 'realised_pnl' or 'pnl'
+                    rp = p.get("realised_pnl")
+                    if rp is not None:
+                        total += float(rp)
+                        found_any = True
+                if found_any:
+                    return round(total, 2)
+        except Exception as e:
+            logger.warning(f"positions-based P&L fetch failed: {e}")
+
+        # Fallback: derive from today's order book (buy vs sell legs)
+        try:
+            today_str = _date.today().strftime("%Y-%m-%d")
+            orders = groww.get_order_list(
+                segment=groww.SEGMENT_FNO,
+            )
+            order_list = orders.get("order_list", []) or orders.get("orders", [])
+            if not order_list:
+                return None
+
+            total = 0.0
+            for o in order_list:
+                if o.get("status", "").upper() not in ("COMPLETE", "FILLED", "TRADED"):
+                    continue
+                order_date = (o.get("order_date") or o.get("created_at") or "")[:10]
+                if order_date and order_date != today_str:
+                    continue
+                qty   = float(o.get("filled_quantity") or o.get("quantity") or 0)
+                price = float(o.get("average_price") or 0)
+                side  = o.get("transaction_type", "").upper()
+                # SELL = credit, BUY = debit (simplistic — assumes same-day round trips)
+                signed = (price * qty) if side == "SELL" else -(price * qty)
+                total += signed
+
+            return round(total, 2) if order_list else None
+
+        except Exception as e:
+            logger.error(f"Order-list-based P&L fetch failed: {e}")
+            return None
+
     # ─── STATE HELPERS ────────────────────────────────────────────────────────
 
     def _get_weekly_pnl(self) -> float:
@@ -194,6 +299,176 @@ class RiskManager:
             f"consec_losses={self.state.get('consecutive_losses', 0)} | "
             f"total_trades={self.state.get('total_trades', 0)}"
         )
+
+
+    def reconcile_with_broker(self, groww) -> dict:
+        """
+        FIX 5: On every startup, reconcile local risk state against
+        the broker's actual position and order data.
+
+        Problem: if the agent crashes mid-trade, the loss is never
+        recorded in risk_state.json. On restart, the bot thinks it
+        hasn't hit its loss limits and keeps trading.
+
+        Solution: fetch today's realised P&L directly from the broker
+        (order history + positions), compare with local state, and
+        take the WORSE of the two figures. Always conservative.
+
+        Returns dict with reconciliation details for logging.
+        """
+        result = {
+            "local_daily_pnl":  self.state.get("daily_pnl", 0.0),
+            "broker_daily_pnl": None,
+            "reconciled_pnl":   self.state.get("daily_pnl", 0.0),
+            "adjustment":       0.0,
+            "open_positions":   [],
+        }
+
+        try:
+            # ── Step 1: Check for any open F&O positions ──────────────────────
+            positions = groww.get_positions_for_user(
+                segment=groww.SEGMENT_FNO
+            )
+            open_pos = [
+                p for p in positions.get("positions", [])
+                if abs(int(p.get("quantity", 0))) > 0
+            ]
+            result["open_positions"] = [
+                {
+                    "symbol":   p.get("trading_symbol"),
+                    "qty":      p.get("quantity"),
+                    "avg":      p.get("average_price"),
+                    "ltp":      p.get("last_traded_price"),
+                    "pnl":      p.get("pnl"),
+                }
+                for p in open_pos
+            ]
+
+            if open_pos:
+                logger.warning(
+                    f"⚠️  {len(open_pos)} open F&O position(s) found on startup. "
+                    f"These may be from a crashed session. Check Groww app."
+                )
+                for p in result["open_positions"]:
+                    logger.warning(
+                        f"  Open: {p['symbol']} qty={p['qty']} "
+                        f"avg=₹{p['avg']} ltp=₹{p['ltp']} pnl=₹{p['pnl']}"
+                    )
+
+            # ── Step 2: Fetch today's realised P&L from order history ─────────
+            from datetime import date as _date
+            today = _date.today().strftime("%Y-%m-%d")
+
+            # Groww order book: fetch completed orders for today
+            orders = groww.get_orders(segment=groww.SEGMENT_FNO)
+            today_orders = [
+                o for o in orders.get("orders", [])
+                if o.get("status", "").upper() in ("COMPLETE", "FILLED", "TRADED")
+                and today in str(o.get("order_timestamp", ""))
+            ]
+
+            # Compute realised P&L from matched buy/sell pairs
+            # Group by symbol: sum up sell proceeds - buy costs
+            from collections import defaultdict
+            symbol_flow = defaultdict(float)
+            for o in today_orders:
+                qty  = int(o.get("filled_quantity", 0))
+                avg  = float(o.get("average_price", 0))
+                txn  = o.get("transaction_type", "").upper()
+                sym  = o.get("trading_symbol", "")
+                if txn == "SELL":
+                    symbol_flow[sym] += qty * avg    # proceeds
+                elif txn == "BUY":
+                    symbol_flow[sym] -= qty * avg    # cost
+
+            broker_pnl = sum(symbol_flow.values())
+            result["broker_daily_pnl"] = round(broker_pnl, 2)
+
+            # ── Step 3: Take the WORSE (more negative) of local vs broker ─────
+            local_pnl  = self.state.get("daily_pnl", 0.0)
+            reconciled = min(local_pnl, broker_pnl)  # always conservative
+            adjustment = reconciled - local_pnl
+
+            if abs(adjustment) > 50:   # only flag meaningful differences
+                logger.warning(
+                    f"📊 Risk reconciliation: "
+                    f"local=₹{local_pnl:.0f} | broker=₹{broker_pnl:.0f} | "
+                    f"using=₹{reconciled:.0f} (adjustment ₹{adjustment:.0f})"
+                )
+                self.state["daily_pnl"] = reconciled
+                self._save_state()
+            else:
+                logger.info(
+                    f"📊 Risk state matches broker (diff ₹{abs(adjustment):.0f} — OK)"
+                )
+
+            result["reconciled_pnl"] = reconciled
+            result["adjustment"]     = round(adjustment, 2)
+
+        except Exception as e:
+            # Reconciliation failure must NOT block trading startup.
+            # Log and continue — local state is better than nothing.
+            logger.error(
+                f"❌ Broker reconciliation failed: {e}. "
+                f"Using local risk state — verify manually."
+            )
+
+        return result
+
+    def record_unrealized_loss(self, unrealized_pnl: float):
+        """
+        FIX 5: Called by the fast monitor loop every 1.5s with the
+        current open position's unrealized P&L.
+        Ensures circuit breakers fire even if the bot crashes before
+        a trade closes — next startup will see the correct state.
+        """
+        if unrealized_pnl >= 0:
+            return   # only track losses
+        key = "peak_unrealized_loss_today"
+        current_peak = self.state.get(key, 0.0)
+        if unrealized_pnl < current_peak:
+            self.state[key] = unrealized_pnl
+            self._save_state()
+
+    def is_trading_allowed(self) -> tuple:
+        """
+        Override: also check if unrealized loss from a previous crashed
+        session would breach daily limit.
+        """
+        # FIX 5: factor in peak unrealized loss from today
+        phantom_loss = self.state.get("peak_unrealized_loss_today", 0.0)
+        if phantom_loss < 0:
+            effective_pnl = self.state.get("daily_pnl", 0.0) + phantom_loss
+            max_daily     = CAPITAL * MAX_DAILY_LOSS_PCT
+            if effective_pnl <= -max_daily:
+                return (
+                    False,
+                    f"DAILY LIMIT (incl. unrealized): "
+                    f"effective loss ₹{abs(effective_pnl):.0f} > ₹{max_daily:.0f}"
+                )
+
+        # Original checks
+        consec = self.state.get("consecutive_losses", 0)
+        if consec >= CONSECUTIVE_LOSS_STOP:
+            return False, f"STOPPED: {consec} consecutive losses"
+        if consec >= CONSECUTIVE_LOSS_PAUSE:
+            if self.state.get("last_loss_date") == str(__import__("datetime").date.today()):
+                return False, f"PAUSED: {consec} consecutive losses"
+        daily_pnl = self.state.get("daily_pnl", 0.0)
+        if daily_pnl <= -(CAPITAL * MAX_DAILY_LOSS_PCT):
+            return False, f"DAILY LIMIT: loss ₹{abs(daily_pnl):.0f}"
+        weekly_pnl = self._get_weekly_pnl()
+        if weekly_pnl <= -(CAPITAL * MAX_WEEKLY_LOSS_PCT):
+            return False, f"WEEKLY LIMIT: loss ₹{abs(weekly_pnl):.0f}"
+        monthly_pnl = self._get_monthly_pnl()
+        if monthly_pnl <= -(CAPITAL * MAX_MONTHLY_LOSS_PCT):
+            return False, f"MONTHLY LIMIT: loss ₹{abs(monthly_pnl):.0f}"
+        return True, "OK"
+
+    def reset_unrealized_peak(self):
+        """Call at start of each day to clear the crash-protection state."""
+        self.state["peak_unrealized_loss_today"] = 0.0
+        self._save_state()
 
     # ─── PERSISTENCE ──────────────────────────────────────────────────────────
 
