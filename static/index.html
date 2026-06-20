@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nifty ORB Trading Bot</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="background-effects">
+        <div class="glow glow-1"></div>
+        <div class="glow glow-2"></div>
+    </div>
+    
+    <div class="container">
+        <header>
+            <div class="title-section">
+                <h1>Nifty ORB Agent</h1>
+                <div class="status-badge" id="bot-status">
+                    <span class="dot"></span>
+                    <span id="status-text">Checking Status...</span>
+                </div>
+            </div>
+            <p class="subtitle">Real-time Performance & Configuration</p>
+        </header>
+
+        <main>
+            <!-- Settings Card -->
+            <section class="card settings-card">
+                <div class="card-header">
+                    <h2>Configuration</h2>
+                </div>
+                <div class="card-body">
+                    <p class="instruction">Enter your daily Groww API TOTP Token and Secret. This will securely update your <code>.env</code> file.</p>
+                    <form id="api-key-form">
+                        <div class="input-group">
+                            <label for="totp-token">TOTP Token</label>
+                            <input type="password" id="totp-token" placeholder="Paste your TOTP Token here" required>
+                        </div>
+                        <div class="input-group">
+                            <label for="totp-secret">TOTP Secret</label>
+                            <input type="password" id="totp-secret" placeholder="Paste your TOTP Secret here" required>
+                        </div>
+                        <button type="submit" id="save-key-btn">Save Configuration</button>
+                    </form>
+                    <div id="notification" class="notification hidden"></div>
+                </div>
+            </section>
+
+            <!-- Stats Grid -->
+            <section class="stats-grid">
+                <div class="card stat-card">
+                    <h3>Today's P&L</h3>
+                    <div class="stat-value" id="daily-pnl">₹0</div>
+                </div>
+                <div class="card stat-card">
+                    <h3>Total P&L</h3>
+                    <div class="stat-value" id="total-pnl">₹0</div>
+                </div>
+                <div class="card stat-card">
+                    <h3>Win Rate</h3>
+                    <div class="stat-value" id="win-rate">0%</div>
+                </div>
+                <div class="card stat-card">
+                    <h3>Total Trades</h3>
+                    <div class="stat-value" id="total-trades">0</div>
+                </div>
+            </section>
+
+            <!-- Trades Table -->
+            <section class="card table-card">
+                <div class="card-header">
+                    <h2>Recent Trades</h2>
+                </div>
+                <div class="table-container">
+                    <table id="trades-table">
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Direction</th>
+                                <th>Strike</th>
+                                <th>Entry</th>
+                                <th>Exit</th>
+                                <th>Net P&L</th>
+                                <th>Exit Reason</th>
+                            </tr>
+                        </thead>
+                        <tbody id="trades-body">
+                            <!-- Populated by JS -->
+                            <tr>
+                                <td colspan="7" class="loading-cell">Loading trade data...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
