@@ -83,7 +83,7 @@ def _log_trade(trade_no: int, signal: ScalpSignal,
         "net_pnl":        summary["net_pnl"],
         "hold_seconds":   summary["hold_seconds"],
         "trail_width":    summary["trail_width"] or 0,
-        "score":          "",
+        "score":          summary.get("momentum_score", "") if summary.get("momentum_score") is not None else "",
         "entry_level":    summary["entry_level"],
         "vwap_at_entry":  signal.vwap,
         "peak_premium":   summary["peak_premium"],
@@ -406,7 +406,7 @@ class PaperScalpRunner:
             logger.info(f"🚫 Entry blocked: {reason}")
             return
 
-        sig = _entry_signal_candidate
+        sig = self.detector.check_entry(candle, self.indicators)
         if sig is None:
             return
 

@@ -94,11 +94,11 @@ class AuthManager:
     def _save_cached_token(self, token: str):
         """Saves token to state file."""
         try:
-            os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+            os.makedirs(os.path.dirname(AUTH_STATE_FILE), exist_ok=True)
             state = self._load_state()
             state["access_token"] = token
             state["token_saved_at"] = time.time()
-            with open( "w") as f:
+            with open(AUTH_STATE_FILE, "w") as f:
                 json.dump(state, f, indent=2)
         except Exception as e:
             logger.warning(f"Could not save token to cache: {e}")
@@ -114,8 +114,8 @@ class AuthManager:
     def _load_state(self) -> dict:
         """Loads the full agent state file."""
         try:
-            if os.path.exists(STATE_FILE):
-                with open( "r") as f:
+            if os.path.exists(AUTH_STATE_FILE):
+                with open(AUTH_STATE_FILE, "r") as f:
                     return json.load(f)
         except Exception:
             pass

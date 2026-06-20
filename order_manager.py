@@ -133,6 +133,41 @@ class OrderManager:
 
     # ─── ENTRY ────────────────────────────────────────────────────────────────
 
+
+    @retry(max_attempts=2, base_delay=1.0)
+    def _check_sufficient_margin(self, required_amount: float) -> tuple:
+        """
+        FIX B: Proactively checks available margin BEFORE placing orders.
+        Returns (sufficient: bool, available: float).
+        Prevents wasted order attempts / API hammering when margin is tight.
+        """
+        try:
+            margin_resp = self.groww.get_available_margin_details(
+                segment=self.groww.SEGMENT_FNO
+            )
+            available = float(
+                margin_resp.get("available_margin")
+                or margin_resp.get("net_margin_available")
+                or 0
+            )
+            # Require a 10% buffer above the exact cost to absorb slippage
+            buffer_required = required_amount * 1.10
+            sufficient = available >= buffer_required
+
+            if not sufficient:
+                logger.warning(
+                    f"⚠️ Insufficient margin: need ₹{buffer_required:.0f} "
+                    f"(incl. 10% buffer), available ₹{available:.0f}"
+                )
+            return sufficient, available
+
+        except Exception as e:
+            logger.warning(
+                f"Could not check margin proactively: {e}. "
+                f"Proceeding — exchange will reject if truly insufficient."
+            )
+            return True, -1.0   # fail-open here only — exchange is the final guard
+
     def enter_trade(self, signal_direction: str, spread_info: dict) -> bool:
         """
         Places both legs of the spread trade.
@@ -152,6 +187,17 @@ class OrderManager:
             f"Sell {spread_info['sell_symbol']} | "
             f"Net cost/unit: ₹{spread_info['net_spread_cost']}"
         )
+
+        # FIX B: proactive margin check before attempting any order
+        required = spread_info.get("total_cost", 0)
+        margin_ok, available = self._check_sufficient_margin(required)
+        if not margin_ok:
+            logger.error(
+                f"🚫 Skipping entry — insufficient margin "
+                f"(need ₹{required*1.1:.0f}, have ₹{available:.0f})"
+            )
+            self.state = TradeState.IDLE
+            return False
 
         try:
             # ── Leg 1: BUY the ATM option ──────────────────────────────────────
@@ -742,11 +788,12 @@ class OrderManager:
                 )
         except Exception as e:
             logger.error(f"Emergency cancel failed: {e} — check Groww app manually")
+        self._emergency_exit_filled_legs()
         self.state = TradeState.IDLE
 
     def _gen_ref_id(self, tag: str) -> str:
         """Generates a unique order reference ID."""
-        ts = datetime.now(IST).strftime("%H%M%S")
+        ts = datetime.now(IST).strftime("%H%M%S%f")[:13]
         return f"ORB-{tag[:8]}-{ts}"
 
     # ─── SUMMARY ──────────────────────────────────────────────────────────────

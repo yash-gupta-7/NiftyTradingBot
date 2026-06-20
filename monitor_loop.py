@@ -132,7 +132,7 @@ class DualLoopMonitor:
             self._state.peak_premium   = entry_premium
 
             # Stop loss
-            self._state.current_sl = round(entry_premium * (1 - SL_PREMIUM_PCT), 2)
+            self._state.current_sl = round(entry_premium * SL_PREMIUM_PCT, 2)
 
             # Level 1 target: entry + (1× ATR × delta) converted to option premium
             # For spread: net spread gains ~SPREAD_DELTA × Nifty move

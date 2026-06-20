@@ -139,145 +139,6 @@ class RiskManager:
         }
 
 
-    # ─── BROKER RECONCILIATION (FIX 5) ─────────────────────────────────────────
-
-    def reconcile_with_broker(self, groww) -> dict:
-        """
-        FIX 5 — Risk State Corruption:
-        On startup, recompute TODAY's realised P&L directly from the
-        broker's order/trade ledger instead of trusting the local JSON
-        blindly. This catches the case where the agent crashed mid-trade
-        and a loss was never written to risk_state.json.
-
-        Strategy:
-          1. Fetch all FNO orders for today from Groww.
-          2. Sum up realised P&L from COMPLETE sell-side trades that
-             closed a position (using average_price × quantity).
-          3. Compare against self.state['daily_pnl'].
-          4. If broker ledger shows MORE loss than local state →
-             local state is stale/corrupted → overwrite with broker truth.
-          5. If they match (or broker shows less / no data) → keep local state.
-
-        This makes daily/weekly/monthly loss limits trustworthy even after
-        a crash, network drop, or unclean shutdown.
-        """
-        try:
-            broker_pnl = self._compute_broker_realised_pnl_today(groww)
-        except Exception as e:
-            logger.error(
-                f"❌ Broker reconciliation failed: {e}. "
-                f"Falling back to local state — VERIFY MANUALLY before trading."
-            )
-            return {"reconciled": False, "reason": str(e)}
-
-        if broker_pnl is None:
-            logger.warning(
-                "⚠️ Could not compute broker P&L (no orders or API issue). "
-                "Using local state as-is."
-            )
-            return {"reconciled": False, "reason": "no_broker_data"}
-
-        local_pnl = self.state.get("daily_pnl", 0.0)
-
-        # Broker ledger is the source of truth whenever it shows MORE
-        # adverse P&L than local state — this is the crash-recovery case.
-        if broker_pnl < local_pnl:
-            logger.warning(
-                f"🚨 RISK STATE CORRECTED: local daily_pnl=₹{local_pnl:.2f} but "
-                f"broker ledger shows ₹{broker_pnl:.2f}. "
-                f"Local state was stale (likely crash mid-trade). Overwriting."
-            )
-            self.state["daily_pnl"] = broker_pnl
-            # Also true-up weekly/monthly by the same delta
-            delta = broker_pnl - local_pnl
-            week_key  = self._week_key()
-            month_key = self._month_key()
-            self.state.setdefault("weekly_pnl", {})
-            self.state.setdefault("monthly_pnl", {})
-            self.state["weekly_pnl"][week_key] = round(
-                self.state["weekly_pnl"].get(week_key, 0.0) + delta, 2
-            )
-            self.state["monthly_pnl"][month_key] = round(
-                self.state["monthly_pnl"].get(month_key, 0.0) + delta, 2
-            )
-            self._save_state()
-            return {
-                "reconciled": True,
-                "corrected": True,
-                "local_pnl": local_pnl,
-                "broker_pnl": broker_pnl,
-                "delta_applied": delta,
-            }
-
-        logger.info(
-            f"✅ Risk state reconciled: local=₹{local_pnl:.2f} | "
-            f"broker=₹{broker_pnl:.2f} | no correction needed"
-        )
-        return {
-            "reconciled": True,
-            "corrected": False,
-            "local_pnl": local_pnl,
-            "broker_pnl": broker_pnl,
-        }
-
-    def _compute_broker_realised_pnl_today(self, groww) -> Optional[float]:
-        """
-        Sums realised P&L from today's COMPLETE F&O orders.
-        Uses trade_list/order_list endpoint if available; falls back
-        to positions' realised P&L field if the broker exposes it directly.
-        """
-        from datetime import date as _date
-
-        # Preferred: broker often exposes realised P&L directly on positions
-        try:
-            positions = groww.get_positions_for_user(segment=groww.SEGMENT_FNO)
-            pos_list  = positions.get("positions", [])
-            if pos_list:
-                total = 0.0
-                found_any = False
-                for p in pos_list:
-                    # Different SDKs expose this as 'realised_pnl' or 'pnl'
-                    rp = p.get("realised_pnl")
-                    if rp is not None:
-                        total += float(rp)
-                        found_any = True
-                if found_any:
-                    return round(total, 2)
-        except Exception as e:
-            logger.warning(f"positions-based P&L fetch failed: {e}")
-
-        # Fallback: derive from today's order book (buy vs sell legs)
-        try:
-            today_str = _date.today().strftime("%Y-%m-%d")
-            orders = groww.get_order_list(
-                segment=groww.SEGMENT_FNO,
-            )
-            order_list = orders.get("order_list", []) or orders.get("orders", [])
-            if not order_list:
-                return None
-
-            total = 0.0
-            for o in order_list:
-                if o.get("status", "").upper() not in ("COMPLETE", "FILLED", "TRADED"):
-                    continue
-                order_date = (o.get("order_date") or o.get("created_at") or "")[:10]
-                if order_date and order_date != today_str:
-                    continue
-                qty   = float(o.get("filled_quantity") or o.get("quantity") or 0)
-                price = float(o.get("average_price") or 0)
-                side  = o.get("transaction_type", "").upper()
-                # SELL = credit, BUY = debit (simplistic — assumes same-day round trips)
-                signed = (price * qty) if side == "SELL" else -(price * qty)
-                total += signed
-
-            return round(total, 2) if order_list else None
-
-        except Exception as e:
-            logger.error(f"Order-list-based P&L fetch failed: {e}")
-            return None
-
-    # ─── STATE HELPERS ────────────────────────────────────────────────────────
-
     def _get_weekly_pnl(self) -> float:
         return self.state.get("weekly_pnl", {}).get(self._week_key(), 0.0)
 
@@ -484,8 +345,11 @@ class RiskManager:
     def _save_state(self):
         try:
             os.makedirs(os.path.dirname(RISK_STATE_FILE), exist_ok=True)
-            with open(RISK_STATE_FILE, "w") as f:
+            import tempfile
+            with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(RISK_STATE_FILE), delete=False, suffix=".tmp") as f:
                 json.dump(self.state, f, indent=2)
+                tmp = f.name
+            os.replace(tmp, RISK_STATE_FILE)
         except Exception as e:
             logger.error(f"❌ Could not save risk state: {e}")
 

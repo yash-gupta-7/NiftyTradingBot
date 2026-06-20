@@ -1,5 +1,7 @@
 
+import logging
 import signal as _signal
+
 
 def _handle_shutdown(sig, frame):
     """FIX #22: Graceful shutdown — square off all positions before exit."""
@@ -109,7 +111,13 @@ class PaperOrderManager(OrderManager):
         return reason
 
     def _execute_level1_exit(self):
-        units = int(self.total_units * 0.40)
+        from config import NIFTY_LOT_SIZE as _LOT
+        from config import LEVEL1_EXIT_PCT
+        raw_units = int(self.total_units * LEVEL1_EXIT_PCT)
+        units = (raw_units // _LOT) * _LOT
+        if units < _LOT:
+            logger.warning("Paper partial exit skipped: < 1 lot")
+            return
         spread_val = self._get_current_spread_value() or self.net_entry_cost
         pnl = (spread_val - self.net_entry_cost) * units
         self.realised_pnl   += pnl
@@ -532,8 +540,7 @@ def run_agent(paper_mode: bool = False, use_v3: bool = False):
     def wait_for(hhmm: str, label: str):
         logger.info(f"⏳ Waiting for {label} ({hhmm})...")
         while True:
-            now = datetime.now(IST).strftime("%H:%M")
-            if now >= hhmm:
+            if _time_reached(hhmm):
                 break
             time.sleep(30)
 

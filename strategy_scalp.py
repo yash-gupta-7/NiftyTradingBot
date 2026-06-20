@@ -24,7 +24,9 @@ IST = pytz.timezone("Asia/Kolkata")
 
 # ─── ALL CONSTANTS (single place, no magic numbers) ───────────────────────────
 
-LOT_SIZE             = 65      # verify via live API before going live
+LOT_SIZE             = 65      # verify via live API — NSE may revise
+# NOTE: Nifty F&O lot size was revised from 75 → 25 in 2024.
+# Run: groww.get_option_chain(...) and check lot_size field before live trading.
 
 # Entry filters
 SWING_LOOKBACK       = 10      # candles for swing high/low detection
@@ -307,6 +309,7 @@ class ScalpPosition:
         self.current_sl    = round(entry_premium - dynamic_sl, 2)
         self.peak_premium  = entry_premium
         self.trail_width   = None   # set at checkpoint
+        self.momentum_score = None  # FIX A: remember score for logging
 
         # Momentum gate counters
         self._gate_fails   = 0
@@ -444,6 +447,7 @@ class ScalpPosition:
                 avg_vol       = avg_vol,
                 last_2_closes = last_2_closes,
             )
+            self.momentum_score = score   # FIX A: persist for logging
 
             if score == 0:
                 # No momentum — take the ₹2 now
@@ -501,6 +505,7 @@ class ScalpPosition:
             "exit_reason":   self.exit_reason,
             "peak_premium":  self.peak_premium,
             "trail_width":   self.trail_width,
+            "momentum_score": self.momentum_score,
             "net_pnl":       self.realised_pnl,
             "hold_seconds":  held,
             "state":         self.state.value,
