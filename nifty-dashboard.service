@@ -1,0 +1,16 @@
+[Unit]
+Description=Nifty Trading Agent - Flask Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/trading_agent
+ExecStart=/home/ubuntu/trading_agent/venv/bin/python dashboard.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/home/ubuntu/trading_agent/logs/dashboard.log
+StandardError=append:/home/ubuntu/trading_agent/logs/dashboard.log
+
+[Install]
+WantedBy=multi-user.target

@@ -11,9 +11,12 @@ import os
 from datetime import date, datetime
 from typing import Optional
 
+import pytz
+
 from config import TRADE_LOG_FILE, DAILY_LOG_FILE, LOG_DIR
 
 logger = logging.getLogger(__name__)
+IST = pytz.timezone("Asia/Kolkata")
 
 
 def setup_logging():

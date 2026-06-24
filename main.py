@@ -38,7 +38,7 @@ import argparse
 import logging
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime
 import pytz
 IST = pytz.timezone('Asia/Kolkata')
 
